@@ -1,0 +1,1 @@
+Please check OFL.txt for the license of each font.
