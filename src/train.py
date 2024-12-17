@@ -1,5 +1,6 @@
 # 学習する
 
+import datetime
 import os
 import torch
 from torch import Tensor
@@ -14,9 +15,12 @@ import torchvision
 
 project_dir = "./"
 
-# データセットのパス（Google Drive内のパスに変更）
-input_dir = project_dir+'font_data/train/input/'
-target_dir = project_dir+'font_data/train/target/'
+train_input_dir = project_dir+'font_data/train/input/'
+train_target_dir = project_dir+'font_data/train/target/'
+
+val_input_dir = project_dir+'font_data/val/input/'
+val_target_dir = project_dir+'font_data/val/target/'
+
 epoch_dir = project_dir+'output/log/epoch/'
 model_dir = project_dir+'output/'
 
@@ -112,11 +116,8 @@ class FontDataset(Dataset):
 
         return input_image, target_image
 
-
-def tensorDataset(input_dir, target_dir, transform):
-    """
-    Datasetを全部VRAMに乗せる
-    """
+def tensorDataset(input_dir, target_dir, transform, device):
+    """Datasetを全部読み込む"""
     input_images = sorted(os.listdir(input_dir))
     target_images = sorted(os.listdir(target_dir))
 
@@ -127,12 +128,11 @@ def tensorDataset(input_dir, target_dir, transform):
         i, t = Image.open(i), Image.open(t)
         if transform:
             i, t = transform(i), transform(t)
-        i, t = i.cuda(), t.cuda()
+        i, t = i.to(device), t.to(device)
         x.append(i)
         y.append(t)
     x, y = torch.stack(x), torch.stack(y)
     return torch.utils.data.TensorDataset(x, y)
-
 
 def show_image(tensor_image, max_images=16):
     """
@@ -152,36 +152,82 @@ def show_image(tensor_image, max_images=16):
     plt.axis('off')
     plt.show()
 
+# Validation loop
+def calculate_val_loss(generator, discriminator, val_loader, criterion_GAN, criterion_L1, device):
+    generator.eval()  # モデルを評価モードに切り替え
+    discriminator.eval()  # モデルを評価モードに切り替え
+
+    val_loss_G = 0
+    val_loss_D = 0
+    val_steps = len(val_loader)
+    gen_output = 0
+
+    with torch.no_grad():  # 勾配計算を行わない
+        for input_image, target_image in val_loader:
+            input_image, target_image = input_image.to(device), target_image.to(device)
+
+            # Generatorの出力を取得
+            gen_output = generator(input_image)
+
+            # Discriminatorの損失
+            pred_real = discriminator(torch.cat((input_image, target_image), 1))
+            loss_D_real = criterion_GAN(pred_real, torch.ones_like(pred_real))
+
+            pred_fake = discriminator(torch.cat((input_image, gen_output), 1))
+            loss_D_fake = criterion_GAN(pred_fake, torch.zeros_like(pred_fake))
+            loss_D = (loss_D_real + loss_D_fake) * 0.5
+
+            # Generatorの損失
+            loss_GAN = criterion_GAN(pred_fake, torch.ones_like(pred_fake))
+            loss_L1 = criterion_L1(gen_output, target_image) * 100
+            loss_G = loss_GAN + loss_L1
+
+            val_loss_G += loss_G.item()
+            val_loss_D += loss_D.item()
+
+    return val_loss_G / val_steps, val_loss_D / val_steps, gen_output
+
+
 def main():
-    # Hyperparameters
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(device)
-    batch_size = 96  # 8192
+    batch_size = 96  #32
     num_epochs = 5000
     os.makedirs(os.path.join(epoch_dir), exist_ok=True)
 
-    # Transforms for resizing and grayscale images
+    # Transforms
     transform = transforms.Compose([transforms.Resize((128, 512)), transforms.Grayscale(), transforms.ToTensor()])
 
-    # DataLoader setup
-    train_dataset = tensorDataset(input_dir, target_dir, transform)
-    #train_dataset = FontDataset(input_dir, target_dir, transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    # DataLoader setup (訓練データと検証データ)
+    #train_dataset = FontDataset(train_input_dir, train_target_dir, transform)
+    train_dataset = tensorDataset(train_input_dir, train_target_dir, transform, device)  # データをcuda上に
+    #val_dataset = FontDataset(val_input_dir, val_target_dir, transform)  # 同じディレクトリで分割する場合
+    val_dataset = tensorDataset(val_input_dir, val_target_dir, transform, device)
 
-    # Model, loss functions, and optimizers setup
-    generator = Generator().cuda()
-    discriminator = Discriminator().cuda()
-    # generator = Generator()
-    # discriminator = Discriminator()
-    criterion_GAN = nn.BCEWithLogitsLoss().cuda()
-    criterion_L1 = nn.L1Loss().cuda()
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)  # 既にcudaにあるので0
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    generator = Generator().to(device)
+    discriminator = Discriminator().to(device)
+
+    criterion_GAN = nn.BCEWithLogitsLoss().to(device)
+    criterion_L1 = nn.L1Loss().to(device)
     optimizer_G = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
     optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
 
+    # Loss tracking lists
+    loss_G_list = []
+    loss_D_list = []
+    val_loss_G_list = []
+    val_loss_D_list = []
+
+    start_time = datetime.datetime.now()
     # Training loop
     for epoch in range(num_epochs):
+        generator.train()  # モデルを学習モードに切り替え
+        discriminator.train()  # モデルを学習モードに切り替え
+
         for i, (input_image, target_image) in enumerate(train_loader):
-            # input_image, target_image = input_image.cuda(), target_image.cuda()
+            input_image, target_image = input_image.to(device), target_image.to(device)
 
             # Generator training
             optimizer_G.zero_grad()
@@ -198,24 +244,51 @@ def main():
             # Discriminator training
             optimizer_D.zero_grad()
             pred_real = discriminator(torch.cat((input_image, target_image), 1))
-            loss_D_real = criterion_GAN(pred_real, torch.ones_like(pred_real, device='cuda'))
+            loss_D_real = criterion_GAN(pred_real, torch.ones_like(pred_real))
             pred_fake = discriminator(torch.cat((input_image, gen_output.detach()), 1))
-            loss_D_fake = criterion_GAN(pred_fake, torch.zeros_like(pred_fake, device='cuda'))
+            loss_D_fake = criterion_GAN(pred_fake, torch.zeros_like(pred_fake))
             loss_D = (loss_D_real + loss_D_fake) * 0.5
             loss_D.backward()
             optimizer_D.step()
 
             # Print logs every 100 steps
             if i % 100 == 0:
-                print(f"Epoch [{epoch}/{num_epochs}], Step [{i}/{len(train_loader)}], Loss_G: {loss_G.item()}, Loss_D: {loss_D.item()}")
+                # print(f"Epoch [{epoch}/{num_epochs}], Step [{i}/{len(train_loader)}], Loss_G: {loss_G.item()}, Loss_D: {loss_D.item()}")
+                loss_G_list.append(loss_G.item())
+                loss_D_list.append(loss_D.item())
+
+        # Validate and print validation loss
+        val_loss_G, val_loss_D, val_output = calculate_val_loss(generator, discriminator, val_loader, criterion_GAN, criterion_L1, device)
+        # print(f"Epoch [{epoch}/{num_epochs}], Val Loss_G: {val_loss_G}, Val Loss_D: {val_loss_D}")
+        val_loss_G_list.append(val_loss_G)
+        val_loss_D_list.append(val_loss_D)
 
         # Save generated image every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        if (epoch) % 5 == 0:
+            elapsed = datetime.datetime.now() - start_time
+            remain = elapsed / (epoch+0.001) * num_epochs
+            print(f"Epoch [{epoch}/{num_epochs}], Val Loss_G: {val_loss_G}, Val Loss_D: {val_loss_D}, estimate: {remain}")
+        if (epoch) % 20 == 0:
             show_image(gen_output)
-        if (epoch + 1) % 100 == 0:
+            show_image(val_output)
+            # Plotting the loss curves
+            plt.figure(figsize=(6, 3))
+            plt.plot(loss_G_list, label='t G Loss')
+            plt.plot(loss_D_list, label='t D Loss')
+            plt.plot(val_loss_G_list, label='v G Loss', linestyle='dashed')
+            plt.plot(val_loss_D_list, label='v D Loss', linestyle='dashed')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.title('Generator and Discriminator Losses')
+            plt.show()
+
+
+        # Save model every 100 epochs
+        if (epoch) % 100 == 0:
             torch.save(generator.state_dict(), model_dir+'/generator.'+str(epoch)+'.pth')
 
-    # Save the models after training
+    # Final model save
     torch.save(generator.state_dict(), model_dir+'/generator.pth')
     torch.save(discriminator.state_dict(), model_dir+'/discriminator.pth')
 
